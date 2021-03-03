@@ -4,9 +4,16 @@ require 'models/concerns/can_be_imported_examples'
 require 'models/concerns/can_csv_import_examples'
 require 'models/concerns/has_history_examples'
 require 'models/concerns/has_tags_examples'
+require 'models/concerns/tag/writes_to_ticket_history_examples'
 require 'models/concerns/has_taskbars_examples'
 require 'models/concerns/has_xss_sanitized_note_examples'
 require 'models/concerns/has_object_manager_attributes_validation_examples'
+require 'models/concerns/ticket/calls_stats_ticket_reopen_log_examples'
+require 'models/concerns/ticket/enqueues_user_ticket_counter_job_examples'
+require 'models/concerns/ticket/resets_pending_time_seconds_examples'
+require 'models/concerns/ticket/sets_close_time_examples'
+require 'models/concerns/ticket/sets_last_owner_update_time_examples'
+require 'models/ticket/escalation_examples'
 
 RSpec.describe Ticket, type: :model do
   subject(:ticket) { create(:ticket) }
@@ -16,9 +23,16 @@ RSpec.describe Ticket, type: :model do
   it_behaves_like 'CanCsvImport'
   it_behaves_like 'HasHistory', history_relation_object: 'Ticket::Article'
   it_behaves_like 'HasTags'
+  it_behaves_like 'TagWritesToTicketHistory'
   it_behaves_like 'HasTaskbars'
   it_behaves_like 'HasXssSanitizedNote', model_factory: :ticket
   it_behaves_like 'HasObjectManagerAttributesValidation'
+  it_behaves_like 'Ticket::Escalation'
+  it_behaves_like 'TicketCallsStatsTicketReopenLog'
+  it_behaves_like 'TicketEnqueuesTicketUserTicketCounterJob'
+  it_behaves_like 'TicketResetsPendingTimeSeconds'
+  it_behaves_like 'TicketSetsCloseTime'
+  it_behaves_like 'TicketSetsLastOwnerUpdateTime'
 
   describe 'Class methods:' do
     describe '.selectors' do
@@ -500,13 +514,11 @@ RSpec.describe Ticket, type: :model do
       end
 
       context 'with a "notification.webhook" trigger', performs_jobs: true do
+        let(:webhook) { create(:webhook, endpoint: 'http://api.example.com/webhook', signature_token: '53CR3t') }
         let(:trigger) do
           create(:trigger,
                  perform: {
-                   'notification.webhook' => {
-                     endpoint: 'http://api.example.com/webhook',
-                     token:    '53CR3t'
-                   }
+                   'notification.webhook' => { 'webhook_id' => webhook.id }
                  })
         end
 
@@ -631,6 +643,52 @@ RSpec.describe Ticket, type: :model do
             expect(ticket.subject_build("[Ticket#: #{ticket.number}] foo"))
               .to eq("[Ticket##{ticket.number}] foo")
           end
+        end
+      end
+    end
+
+    describe '#last_original_update_at' do
+      let(:result) { ticket.last_original_update_at }
+
+      it 'returns initial customer enquiry time when customer contacted repeatedly' do
+        ticket
+
+        target = create(:ticket_article, :inbound_email, ticket: ticket)
+        travel 10.minutes
+        create(:ticket_article, :inbound_email, ticket: ticket)
+
+        expect(result).to eq target.created_at
+      end
+
+      it 'returns agent contact time when customer did not respond to agent reach out' do
+        ticket
+        create(:ticket_article, :outbound_email, ticket: ticket)
+
+        expect(result).to eq ticket.last_contact_agent_at
+      end
+
+      it 'returns nil if no customer response' do
+        ticket
+        expect(result).to be_nil
+      end
+
+      context 'with customer enquiry and agent response' do
+        before do
+          ticket
+          create(:ticket_article, :inbound_email, ticket: ticket)
+          travel 10.minutes
+          create(:ticket_article, :outbound_email, ticket: ticket)
+          travel 10.minutes
+        end
+
+        it 'returns last customer enquiry time when agent did not respond yet' do
+          target = create(:ticket_article, :inbound_email, ticket: ticket)
+
+          expect(result).to eq target.created_at
+        end
+
+        it 'returns agent response time when agent responded to customer enquiry' do
+          expect(result).to eq ticket.last_contact_agent_at
         end
       end
     end
@@ -837,12 +895,12 @@ RSpec.describe Ticket, type: :model do
 
           let(:article) { create(:ticket_article, ticket: ticket, sender_name: 'Agent') }
 
-          it 'is updated based on the SLA’s #update_time' do
+          it 'is updated based on the SLA’s #close_escalation_at' do
             travel(1.minute) # time is frozen: if we don't travel forward, pre- and post-update values will be the same
 
             expect { article }
-              .to change { ticket.reload.escalation_at.to_i }
-              .to eq(3.hours.from_now.to_i)
+              .to change { ticket.reload.escalation_at }
+              .to(ticket.reload.close_escalation_at)
           end
 
           context 'when new #update_time is later than original #solution_time' do
@@ -850,8 +908,8 @@ RSpec.describe Ticket, type: :model do
               travel(2.hours) # time is frozen: if we don't travel forward, pre- and post-update values will be the same
 
               expect { article }
-                .to change { ticket.reload.escalation_at.to_i }
-                .to eq(4.hours.after(ticket.created_at).to_i)
+                .to change { ticket.reload.escalation_at }
+                .to(4.hours.after(ticket.created_at))
             end
           end
         end
@@ -978,8 +1036,8 @@ RSpec.describe Ticket, type: :model do
 
           let(:article) { create(:ticket_article, ticket: ticket, sender_name: 'Agent') }
 
-          it 'does not change' do
-            expect { article }.not_to change(ticket, :first_response_escalation_at)
+          it 'is cleared' do
+            expect { article }.to change { ticket.reload.first_response_escalation_at }.to(nil)
           end
         end
       end
@@ -1001,6 +1059,9 @@ RSpec.describe Ticket, type: :model do
         before { sla } # create sla
 
         it 'is set based on SLA’s #update_time' do
+          travel 1.minute
+          create(:ticket_article, ticket: ticket, sender_name: 'Customer')
+
           expect(ticket.reload.update_escalation_at.to_i)
             .to eq(3.hours.from_now.to_i)
         end
@@ -1011,11 +1072,12 @@ RSpec.describe Ticket, type: :model do
           let(:article) { create(:ticket_article, ticket: ticket, sender_name: 'Agent') }
 
           it 'is updated based on the SLA’s #update_time' do
-            travel(1.minute) # time is frozen: if we don't travel forward, pre- and post-update values will be the same
+            create(:ticket_article, ticket: ticket, sender_name: 'Customer')
+            travel(1.minute)
 
             expect { article }
-              .to change { ticket.reload.update_escalation_at.to_i }
-              .to(3.hours.from_now.to_i)
+              .to change { ticket.reload.update_escalation_at }
+              .to(nil)
           end
         end
       end
@@ -1446,4 +1508,189 @@ RSpec.describe Ticket, type: :model do
       end
     end
   end
+
+  describe '.search_index_attribute_lookup_oversized?' do
+    subject!(:ticket) { create(:ticket) }
+
+    context 'when payload is ok' do
+      let(:current_payload_size) { 3.megabyte }
+
+      it 'return false' do
+        expect(ticket.send(:search_index_attribute_lookup_oversized?, current_payload_size)).to eq false
+      end
+    end
+
+    context 'when payload is bigger' do
+      let(:current_payload_size) { 350.megabyte }
+
+      it 'return true' do
+        expect(ticket.send(:search_index_attribute_lookup_oversized?, current_payload_size)).to eq true
+      end
+    end
+  end
+
+  describe '.search_index_attribute_lookup_file_oversized?' do
+    subject!(:store) do
+      Store.add(
+        object:        'SomeObject',
+        o_id:          1,
+        data:          (1024**800_000).to_s, # with 2.4 mb
+        filename:      'test.TXT',
+        created_by_id: 1,
+      )
+    end
+
+    context 'when total payload is ok' do
+      let(:current_payload_size) { 200.megabyte }
+
+      it 'return false' do
+        expect(ticket.send(:search_index_attribute_lookup_file_oversized?, store, current_payload_size)).to eq false
+      end
+    end
+
+    context 'when total payload is oversized' do
+      let(:current_payload_size) { 299.megabyte }
+
+      it 'return true' do
+        expect(ticket.send(:search_index_attribute_lookup_file_oversized?, store, current_payload_size)).to eq true
+      end
+    end
+  end
+
+  describe '.search_index_attribute_lookup_file_ignored?' do
+    context 'when attachment is indexable' do
+      subject!(:store_with_indexable_extention) do
+        Store.add(
+          object:        'SomeObject',
+          o_id:          1,
+          data:          'some content',
+          filename:      'test.TXT',
+          created_by_id: 1,
+        )
+      end
+
+      it 'return false' do
+        expect(ticket.send(:search_index_attribute_lookup_file_ignored?, store_with_indexable_extention)).to eq false
+      end
+    end
+
+    context 'when attachment is no indexable' do
+      subject!(:store_without_indexable_extention) do
+        Store.add(
+          object:        'SomeObject',
+          o_id:          1,
+          data:          'some content',
+          filename:      'test.BIN',
+          created_by_id: 1,
+        )
+      end
+
+      it 'return true' do
+        expect(ticket.send(:search_index_attribute_lookup_file_ignored?, store_without_indexable_extention)).to eq true
+      end
+    end
+  end
+
+  describe '.search_index_attribute_lookup' do
+    subject!(:ticket) { create(:ticket) }
+
+    let(:search_index_attribute_lookup) do
+      article1 = create(:ticket_article, ticket: ticket)
+      Store.add(
+        object:        'Ticket::Article',
+        o_id:          article1.id,
+        data:          'some content',
+        filename:      'some_file.bin',
+        preferences:   {
+          'Content-Type' => 'text/plain',
+        },
+        created_by_id: 1,
+      )
+      Store.add(
+        object:        'Ticket::Article',
+        o_id:          article1.id,
+        data:          (1024**800_000).to_s, # with 2.4 mb
+        filename:      'some_file.pdf',
+        preferences:   {
+          'Content-Type' => 'image/pdf',
+        },
+        created_by_id: 1,
+      )
+      Store.add(
+        object:        'Ticket::Article',
+        o_id:          article1.id,
+        data:          (1024**2_000_000).to_s, # with 5,8 mb
+        filename:      'some_file.txt',
+        preferences:   {
+          'Content-Type' => 'text/plain',
+        },
+        created_by_id: 1,
+      )
+      create(:ticket_article, ticket: ticket, body: (1024**400_000).to_s.split(/(.{100})/).join(' ')) # body with 1,2 mb
+      create(:ticket_article, ticket: ticket)
+      ticket.search_index_attribute_lookup
+    end
+
+    context 'when es_attachment_max_size_in_mb takes all attachments' do
+      before { Setting.set('es_attachment_max_size_in_mb', 15) }
+
+      it 'verify count of articles' do
+        expect(search_index_attribute_lookup['article'].count).to eq 3
+      end
+
+      it 'verify count of attachments' do
+        expect(search_index_attribute_lookup['article'][0]['attachment'].count).to eq 2
+      end
+
+      it 'verify if pdf exists' do
+        expect(search_index_attribute_lookup['article'][0]['attachment'][0]['_name']).to eq 'some_file.pdf'
+      end
+
+      it 'verify if txt exists' do
+        expect(search_index_attribute_lookup['article'][0]['attachment'][1]['_name']).to eq 'some_file.txt'
+      end
+    end
+
+    context 'when es_attachment_max_size_in_mb takes only one attachment' do
+      before { Setting.set('es_attachment_max_size_in_mb', 4) }
+
+      it 'verify count of articles' do
+        expect(search_index_attribute_lookup['article'].count).to eq 3
+      end
+
+      it 'verify count of attachments' do
+        expect(search_index_attribute_lookup['article'][0]['attachment'].count).to eq 1
+      end
+
+      it 'verify if pdf exists' do
+        expect(search_index_attribute_lookup['article'][0]['attachment'][0]['_name']).to eq 'some_file.pdf'
+      end
+    end
+
+    context 'when es_attachment_max_size_in_mb takes no attachment' do
+      before { Setting.set('es_attachment_max_size_in_mb', 2) }
+
+      it 'verify count of articles' do
+        expect(search_index_attribute_lookup['article'].count).to eq 3
+      end
+
+      it 'verify count of attachments' do
+        expect(search_index_attribute_lookup['article'][0]['attachment'].count).to eq 0
+      end
+    end
+
+    context 'when es_total_max_size_in_mb takes no attachment and no oversized article' do
+      before { Setting.set('es_total_max_size_in_mb', 1) }
+
+      it 'verify count of articles' do
+        expect(search_index_attribute_lookup['article'].count).to eq 2
+      end
+
+      it 'verify count of attachments' do
+        expect(search_index_attribute_lookup['article'][0]['attachment'].count).to eq 0
+      end
+    end
+
+  end
+
 end

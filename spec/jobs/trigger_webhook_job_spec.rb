@@ -1,6 +1,55 @@
 require 'rails_helper'
 
 RSpec.describe TriggerWebhookJob, type: :job do
+
+  let(:endpoint) { 'http://api.example.com/webhook' }
+  let(:token) { 's3cr3t-t0k3n' }
+  let(:webhook) { create(:webhook, endpoint: endpoint, signature_token: token) }
+  let(:trigger) do
+    create(:trigger,
+           perform: {
+             'notification.webhook' => { 'webhook_id' => webhook.id }
+           })
+  end
+
+  context 'when serialized model argument gets deleted' do
+
+    subject!(:job) { described_class.perform_later(trigger, ticket, article) }
+
+    let(:ticket) { create(:ticket) }
+    let(:article) { create(:'ticket/article') }
+
+    shared_examples 'handle deleted argument models' do
+      it 'raises no error' do
+        expect { ActiveJob::Base.execute job.serialize }.not_to raise_error
+      end
+
+      it "doesn't perform request" do
+        allow(UserAgent).to receive(:post)
+        ActiveJob::Base.execute job.serialize
+        expect(UserAgent).not_to have_received(:post)
+      end
+    end
+
+    context 'when Trigger gets deleted' do
+      before { trigger.destroy! }
+
+      include_examples 'handle deleted argument models'
+    end
+
+    context 'when Ticket gets deleted' do
+      before { ticket.destroy! }
+
+      include_examples 'handle deleted argument models'
+    end
+
+    context 'when Article gets deleted' do
+      before { article.destroy! }
+
+      include_examples 'handle deleted argument models'
+    end
+  end
+
   describe '#perform' do
     subject(:perform) { described_class.perform_now(trigger, ticket, article) }
 
@@ -9,19 +58,6 @@ RSpec.describe TriggerWebhookJob, type: :job do
 
     let!(:ticket) { create(:ticket) }
     let!(:article) { create(:'ticket/article') }
-
-    let(:trigger) do
-      create(:trigger,
-             perform: {
-               'notification.webhook' => {
-                 endpoint: endpoint,
-                 token:    token
-               }
-             })
-    end
-
-    let(:endpoint) { 'http://api.example.com/webhook' }
-    let(:token) { 's3cr3t-t0k3n' }
 
     let(:response_status) { 200 }
     let(:payload) do

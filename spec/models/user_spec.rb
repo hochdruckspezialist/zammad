@@ -7,6 +7,7 @@ require 'models/concerns/has_groups_permissions_examples'
 require 'models/concerns/has_xss_sanitized_note_examples'
 require 'models/concerns/can_be_imported_examples'
 require 'models/concerns/has_object_manager_attributes_validation_examples'
+require 'models/concerns/user/performs_geo_lookup_examples'
 require 'models/user/has_ticket_create_screen_impact_examples'
 require 'models/user/can_lookup_search_index_attributes_examples'
 require 'models/concerns/has_taskbars_examples'
@@ -29,6 +30,7 @@ RSpec.describe User, type: :model do
   it_behaves_like 'User::HasTicketCreateScreenImpact'
   it_behaves_like 'CanLookupSearchIndexAttributes'
   it_behaves_like 'HasTaskbars'
+  it_behaves_like 'UserPerformsGeoLookup'
 
   describe 'Class methods:' do
     describe '.authenticate' do
@@ -822,7 +824,7 @@ RSpec.describe User, type: :model do
       refs_known = { 'Group'                              => { 'created_by_id' => 1, 'updated_by_id' => 0 },
                      'Token'                              => { 'user_id' => 1 },
                      'Ticket::Article'                    =>
-                                                             { 'created_by_id' => 0, 'updated_by_id' => 0, 'origin_by_id' => 1 },
+                                                             { 'created_by_id' => 1, 'updated_by_id' => 1, 'origin_by_id' => 1 },
                      'Ticket::StateType'                  => { 'created_by_id' => 0, 'updated_by_id' => 0 },
                      'Ticket::Article::Sender'            => { 'created_by_id' => 0, 'updated_by_id' => 0 },
                      'Ticket::Article::Type'              => { 'created_by_id' => 0, 'updated_by_id' => 0 },
@@ -869,7 +871,8 @@ RSpec.describe User, type: :model do
                      'Macro'                              => { 'created_by_id' => 0, 'updated_by_id' => 0 },
                      'Channel'                            => { 'created_by_id' => 0, 'updated_by_id' => 0 },
                      'Role'                               => { 'created_by_id' => 0, 'updated_by_id' => 0 },
-                     'History'                            => { 'created_by_id' => 1 },
+                     'History'                            => { 'created_by_id' => 2 },
+                     'Webhook'                            => { 'created_by_id' => 0, 'updated_by_id' => 0 },
                      'Overview'                           => { 'created_by_id' => 1, 'updated_by_id' => 0 },
                      'ActivityStream'                     => { 'created_by_id' => 0 },
                      'StatsStore'                         => { 'created_by_id' => 0 },
@@ -903,7 +906,7 @@ RSpec.describe User, type: :model do
       group                 = create(:group, created_by_id: user.id)
       job                   = create(:job, updated_by_id: user.id)
       ticket                = create(:ticket, group: group_subject, owner: user)
-      ticket_article        = create(:ticket_article, ticket: ticket, origin_by_id: user.id)
+      ticket_article        = create(:ticket_article, ticket: ticket, created_by_id: user.id, updated_by_id: user.id, origin_by_id: user.id)
       customer_ticket1      = create(:ticket, group: group_subject, customer: user)
       customer_ticket2      = create(:ticket, group: group_subject, customer: user)
       customer_ticket3      = create(:ticket, group: group_subject, customer: user)
@@ -933,7 +936,10 @@ RSpec.describe User, type: :model do
       expect { group.reload }.to change(group, :created_by_id).to(1)
       expect { job.reload }.to change(job, :updated_by_id).to(1)
       expect { ticket.reload }.to change(ticket, :owner_id).to(1)
-      expect { ticket_article.reload }.to change(ticket_article, :origin_by_id).to(1)
+      expect { ticket_article.reload }
+        .to change(ticket_article, :origin_by_id).to(1)
+        .and change(ticket_article, :updated_by_id).to(1)
+        .and change(ticket_article, :created_by_id).to(1)
       expect { knowledge_base_answer.reload }
         .to change(knowledge_base_answer, :archived_by_id).to(1)
         .and change(knowledge_base_answer, :published_by_id).to(1)

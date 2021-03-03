@@ -15,17 +15,26 @@ class Ticket < ApplicationModel
   include HasLinks
   include HasObjectManagerAttributesValidation
   include HasTaskbars
+  include Ticket::CallsStatsTicketReopenLog
+  include Ticket::EnqueuesUserTicketCounterJob
+  include Ticket::ResetsPendingTimeSeconds
+  include Ticket::SetsCloseTime
+  include Ticket::SetsOnlineNotificationSeen
+  include Ticket::TouchesAssociations
 
-  include Ticket::Escalation
-  include Ticket::Subject
-  include Ticket::Assets
-  include Ticket::SearchIndex
-  include Ticket::Search
-  include Ticket::MergeHistory
+  include ::Ticket::Escalation
+  include ::Ticket::Subject
+  include ::Ticket::Assets
+  include ::Ticket::SearchIndex
+  include ::Ticket::Search
+  include ::Ticket::MergeHistory
 
   store          :preferences
   before_create  :check_generate, :check_defaults, :check_title, :set_default_state, :set_default_priority
   before_update  :check_defaults, :check_title, :reset_pending_time, :check_owner_active
+
+  # This must be loaded late as it depends on the internal before_create and before_update handlers of ticket.rb.
+  include Ticket::SetsLastOwnerUpdateTime
 
   validates :group_id, presence: true
 
@@ -566,7 +575,7 @@ condition example
     # get tables to join
     tables = ''
     selectors.each_key do |attribute|
-      selector = attribute.split(/\./)
+      selector = attribute.split('.')
       next if !selector[1]
       next if selector[0] == 'ticket'
       next if selector[0] == 'execution_time'
@@ -621,7 +630,7 @@ condition example
       return nil if selector['pre_condition'] && selector['pre_condition'] !~ /^(not_set|current_user\.|specific)/
 
       # get attributes
-      attributes = attribute.split(/\./)
+      attributes = attribute.split('.')
       attribute = "#{ActiveRecord::Base.connection.quote_table_name("#{attributes[0]}s")}.#{ActiveRecord::Base.connection.quote_column_name(attributes[1])}"
 
       # magic selectors
@@ -630,7 +639,7 @@ condition example
       end
 
       if attributes[0] == 'ticket' && attributes[1] == 'tags'
-        selector['value'] = selector['value'].split(/,/).collect(&:strip)
+        selector['value'] = selector['value'].split(',').collect(&:strip)
       end
 
       if selector['operator'].include?('in working time')
@@ -984,7 +993,7 @@ perform changes on ticket
       if key == 'ticket.tags'
         next if value['value'].blank?
 
-        tags = value['value'].split(/,/)
+        tags = value['value'].split(',')
         case value['operator']
         when 'add'
           tags.each do |tag|
@@ -1332,6 +1341,24 @@ result
 
   def articles
     Ticket::Article.where(ticket_id: id).order(:created_at, :id)
+  end
+
+  # Get whichever #last_contact_* was later
+  # This is not identical to #last_contact_at
+  # It returns time to last original (versus follow up) contact
+  # @return [Time, nil]
+  def last_original_update_at
+    [last_contact_agent_at, last_contact_customer_at].compact.max
+  end
+
+  # true if conversation did happen and agent responded
+  # false if customer is waiting for response or agent reached out and customer did not respond yet
+  # @return [Bool]
+  def agent_responded?
+    return false if last_contact_customer_at.blank?
+    return false if last_contact_agent_at.blank?
+
+    last_contact_customer_at < last_contact_agent_at
   end
 
   private

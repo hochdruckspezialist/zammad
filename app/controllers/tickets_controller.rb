@@ -157,7 +157,7 @@ class TicketsController < ApplicationController
 
       # create tags if given
       if params[:tags].present?
-        tags = params[:tags].split(/,/)
+        tags = params[:tags].split(',')
         tags.each do |tag|
           ticket.tag_add(tag)
         end
@@ -243,7 +243,7 @@ class TicketsController < ApplicationController
 
     ticket.with_lock do
       ticket.update!(clean_params)
-      if params[:article]
+      if params[:article].present?
         article_create(ticket, params[:article])
       end
     end
